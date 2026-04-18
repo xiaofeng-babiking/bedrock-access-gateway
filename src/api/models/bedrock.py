@@ -107,6 +107,15 @@ NO_ASSISTANT_PREFILL_MODELS = {
     "claude-opus-4-6",
 }
 
+# Fallback maxTokens used only when reasoning_effort is enabled AND the client
+# did not specify either max_tokens or max_completion_tokens.  Bedrock's
+# reasoning API requires a concrete budget_tokens value (which must be
+# strictly less than maxTokens), so we cannot pass None here.  32K is a
+# reasonable default that leaves room for both thinking and response content
+# without capping the output prematurely.  Clients who want a specific cap
+# should pass max_tokens explicitly.
+REASONING_DEFAULT_MAX_TOKENS = 32_000
+
 
 def list_bedrock_models() -> dict:
     """Automatically getting a list of supported models.
@@ -774,12 +783,12 @@ class BedrockModel(BaseChatModel):
         messages = self._parse_messages(chat_request)
         system_prompts = self._parse_system_prompts(chat_request)
 
-        # Base inference parameters.
-        inference_config = {
-            "maxTokens": chat_request.max_tokens,
-        }
-
-        # Only include optional parameters when specified
+        # Base inference parameters — treat every optional field uniformly:
+        # only include a key when the client explicitly set it.  Omitting
+        # `maxTokens` lets Bedrock use the model's native output ceiling.
+        inference_config: dict = {}
+        if chat_request.max_tokens is not None:
+            inference_config["maxTokens"] = chat_request.max_tokens
         if chat_request.temperature is not None:
             inference_config["temperature"] = chat_request.temperature
         if chat_request.top_p is not None:
@@ -818,11 +827,16 @@ class BedrockModel(BaseChatModel):
             model_lower = resolved_model.lower()
 
             if "anthropic.claude" in model_lower:
-                # Claude format: reasoning_config = object with budget_tokens
+                # Claude format: reasoning_config = object with budget_tokens.
+                # budget_tokens must be strictly less than maxTokens, so when
+                # reasoning is enabled we need a concrete number.  Prefer
+                # the explicit request fields; fall back to a sensible cap
+                # that matches typical reasoning workloads without capping
+                # the response prematurely.
                 max_tokens = (
                     chat_request.max_completion_tokens
-                    if chat_request.max_completion_tokens
-                    else chat_request.max_tokens
+                    or chat_request.max_tokens
+                    or REASONING_DEFAULT_MAX_TOKENS
                 )
                 budget_tokens = self._calc_budget_tokens(
                     max_tokens, chat_request.reasoning_effort

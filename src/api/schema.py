@@ -106,7 +106,12 @@ class ChatRequest(BaseModel):
     temperature: float | None = Field(default=None, le=2.0, ge=0.0)
     top_p: float | None = Field(default=None, le=1.0, ge=0.0)
     user: str | None = None  # Not used
-    max_tokens: int | None = 2048
+    # max_tokens: when omitted, the field stays None and the proxy does NOT
+    # inject a default.  The Bedrock Converse call omits `maxTokens` entirely
+    # so the backend uses the model's native output ceiling (e.g. 128K for
+    # Claude Opus 4.6, 64K for Sonnet 4.6) rather than an arbitrary gateway
+    # default.  Clients that need a specific cap must send it explicitly.
+    max_tokens: int | None = None
     max_completion_tokens: int | None = None
     reasoning_effort: Literal["low", "medium", "high"] | None = None
     n: int | None = 1  # Not used
