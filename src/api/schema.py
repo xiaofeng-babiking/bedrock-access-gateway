@@ -11,6 +11,12 @@ class Model(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     object: str | None = "model"
     owned_by: str | None = "bedrock"
+    # Capability metadata (OpenRouter convention).  Nullable because not
+    # every Bedrock model has entries in the proxy's internal capability
+    # table; clients should treat null as "unknown" rather than as an
+    # implicit default.
+    context_length: int | None = None
+    max_completion_tokens: int | None = None
 
 
 class Models(BaseModel):

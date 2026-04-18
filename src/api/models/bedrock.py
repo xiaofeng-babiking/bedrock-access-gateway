@@ -15,6 +15,7 @@ from fastapi import HTTPException
 from starlette.concurrency import run_in_threadpool
 
 from api.models.base import BaseChatModel, BaseEmbeddingsModel
+from api.models.capabilities import lookup_capabilities
 from api.schema import (
     AssistantMessage,
     ChatRequest,
@@ -197,21 +198,36 @@ def list_bedrock_models() -> dict:
 
             inference_types = model.get("inferenceTypesSupported", [])
             input_modalities = model["inputModalities"]
+
+            def _build_entry(entry_id: str) -> dict:
+                """Build a model_list entry with modalities + capability metadata.
+
+                Capabilities come from a static lookup table (see
+                api.models.capabilities); modalities come from Bedrock's
+                list_foundation_models response.  Cross-region inference
+                profile IDs (e.g. us.*, global.*, apac.*) match the same
+                foundation model family in the capability table.
+                """
+                return {"modalities": input_modalities, **lookup_capabilities(entry_id)}
+
             # Add on-demand model list
             if "ON_DEMAND" in inference_types:
-                model_list[model_id] = {"modalities": input_modalities}
+                model_list[model_id] = _build_entry(model_id)
 
             # Add all inference profiles (cross-region and application) for this model
             for profile_id, metadata in profile_metadata.items():
                 if metadata.get("underlying_model_id") == model_id:
-                    model_list[profile_id] = {"modalities": input_modalities}
+                    model_list[profile_id] = _build_entry(profile_id)
 
     except Exception as e:
         logger.error(f"Unable to list models: {str(e)}")
 
     if not model_list:
         # In case stack not updated.
-        model_list[DEFAULT_MODEL] = {"modalities": ["TEXT", "IMAGE"]}
+        model_list[DEFAULT_MODEL] = {
+            "modalities": ["TEXT", "IMAGE"],
+            **lookup_capabilities(DEFAULT_MODEL),
+        }
 
     return model_list
 
@@ -226,6 +242,23 @@ class BedrockModel(BaseChatModel):
         global bedrock_model_list
         bedrock_model_list = list_bedrock_models()
         return list(bedrock_model_list.keys())
+
+    def list_models_with_metadata(self) -> dict[str, dict]:
+        """Return the full metadata dict for all models.
+
+        Refreshes the backing list (same side effect as list_models) and
+        returns a mapping of ``model_id -> {modalities, context_length,
+        max_completion_tokens}``.  Used by the /v1/models router to expose
+        capability metadata in OpenRouter-compatible fields.
+        """
+        global bedrock_model_list
+        bedrock_model_list = list_bedrock_models()
+        return dict(bedrock_model_list)
+
+    def get_model_metadata(self, model_id: str) -> dict:
+        """Return the metadata dict for a single model, or an empty dict
+        if the model is unknown.  Never raises."""
+        return dict(bedrock_model_list.get(model_id, {}))
 
     def validate(self, chat_request: ChatRequest):
         """Perform basic validation on requests"""
