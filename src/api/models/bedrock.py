@@ -371,17 +371,48 @@ class BedrockModel(BaseChatModel):
         return response
 
     async def chat(self, chat_request: ChatRequest) -> ChatResponse:
-        """Default implementation for Chat API."""
+        """Default implementation for Chat API.
 
+        Internally invokes ``converse_stream`` (not ``converse``) and
+        aggregates streaming events into a single response envelope
+        matching what ``converse`` would have returned.  The caller
+        sees the same ``ChatResponse`` shape either way.
+
+        Why stream internally
+        ---------------------
+        Non-streaming ``converse`` calls buffer the entire response at
+        Bedrock's side before sending any bytes back — a 60-second
+        generation sends 60 seconds of TCP silence to the proxy, during
+        which any intermediary (ALB idle timer, VPC endpoint deadline,
+        load balancer deregistration) may close the connection without
+        emitting an HTTP response.  The resulting failure mode is
+        ``curl: (52) Empty reply from server`` — zero bytes, no status
+        code, no actionable error.
+
+        By using ``converse_stream`` internally and buffering chunks
+        locally, bytes flow between Bedrock and the proxy every few
+        hundred ms throughout the request lifetime.  Intermediaries
+        never idle-close the connection.  The proxy then assembles
+        the chunks into a single ``ChatResponse`` and returns it
+        synchronously to non-streaming clients, who see no behavioral
+        change beyond the absence of silent-failure modes.
+        """
         message_id = self.generate_message_id()
-        response = await self._invoke_bedrock(chat_request)
+        stream_response = await self._invoke_bedrock(chat_request, stream=True)
+        response = await self._aggregate_stream_response(
+            stream_response.get("stream"),
+            chat_request.model,
+        )
 
         output_message = response["output"]["message"]
         usage = response["usage"]
 
-        # Extract all token counts
-        output_tokens = usage["outputTokens"]
-        total_tokens = usage["totalTokens"]
+        # Extract all token counts.  Use .get() with 0 defaults because a
+        # stream that errors out may not emit the final metadata event,
+        # and we want to surface whatever partial info we have rather
+        # than crash on a missing key.
+        output_tokens = usage.get("outputTokens", 0)
+        total_tokens = usage.get("totalTokens", 0)
         finish_reason = response["stopReason"]
 
         # Extract prompt caching metrics if available
@@ -407,6 +438,175 @@ class BedrockModel(BaseChatModel):
         if DEBUG:
             logger.info("Proxy response :" + chat_response.model_dump_json())
         return chat_response
+
+    async def _aggregate_stream_response(
+        self, stream, model: str
+    ) -> dict:
+        """Consume a ``converse_stream`` event iterator and assemble a
+        dict matching the shape of a ``converse`` (non-streaming)
+        response.
+
+        Returned dict shape
+        -------------------
+            {
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"text": "..."} | {"toolUse": {...}} | {"reasoningContent": {...}},
+                            ...
+                        ],
+                    }
+                },
+                "usage": {"inputTokens": ..., "outputTokens": ..., "totalTokens": ...},
+                "stopReason": "end_turn" | "tool_use" | ...,
+            }
+
+        Stream-error events (modelStreamErrorException, throttling,
+        serviceUnavailable, etc.) are re-raised as ``HTTPException``
+        with the appropriate status code so the handler surfaces them
+        cleanly instead of returning a truncated response.
+        """
+        content_blocks: list[dict] = []
+        # Pending block currently being assembled; flushed on contentBlockStop.
+        current_block: dict | None = None
+        current_tool_input_json: str = ""
+
+        stop_reason: str | None = None
+        usage: dict = {}
+
+        async for event in self._async_iterate(stream):
+            if "messageStart" in event:
+                # Just marks the beginning — role is always "assistant"
+                continue
+
+            elif "contentBlockStart" in event:
+                # A new block begins.  For tool_use, the start event
+                # carries the id + name; for text/reasoning blocks the
+                # start event may be absent (block created on first delta).
+                start_data = event["contentBlockStart"].get("start", {})
+                if "toolUse" in start_data:
+                    current_block = {
+                        "toolUse": {
+                            "toolUseId": start_data["toolUse"]["toolUseId"],
+                            "name": start_data["toolUse"]["name"],
+                        },
+                    }
+                    current_tool_input_json = ""
+
+            elif "contentBlockDelta" in event:
+                delta = event["contentBlockDelta"].get("delta", {})
+                if "text" in delta:
+                    if current_block is None or "text" not in current_block:
+                        # Text block without an explicit start event
+                        current_block = {"text": delta["text"]}
+                    else:
+                        current_block["text"] += delta["text"]
+                elif "toolUse" in delta:
+                    # Accumulate the partial JSON input — parsed on stop
+                    current_tool_input_json += delta["toolUse"].get("input", "")
+                elif "reasoningContent" in delta:
+                    rc = delta["reasoningContent"]
+                    if current_block is None or "reasoningContent" not in current_block:
+                        current_block = {
+                            "reasoningContent": {
+                                "reasoningText": {"text": "", "signature": ""},
+                            }
+                        }
+                    rt = current_block["reasoningContent"]["reasoningText"]
+                    if "text" in rc:
+                        rt["text"] = rt.get("text", "") + rc["text"]
+                    if "signature" in rc:
+                        rt["signature"] = rc["signature"]
+
+            elif "contentBlockStop" in event:
+                if current_block is not None:
+                    if "toolUse" in current_block:
+                        # Parse accumulated JSON arguments into a dict.
+                        # An empty string is a valid "no arguments" case.
+                        if current_tool_input_json:
+                            try:
+                                current_block["toolUse"]["input"] = json.loads(
+                                    current_tool_input_json
+                                )
+                            except json.JSONDecodeError:
+                                # Preserve the raw string so the tool
+                                # call isn't lost entirely; callers can
+                                # still see something went wrong.
+                                current_block["toolUse"]["input"] = {
+                                    "_raw": current_tool_input_json
+                                }
+                        else:
+                            current_block["toolUse"]["input"] = {}
+                    content_blocks.append(current_block)
+                    current_block = None
+                    current_tool_input_json = ""
+
+            elif "messageStop" in event:
+                stop_reason = event["messageStop"].get("stopReason")
+
+            elif "metadata" in event:
+                meta = event["metadata"]
+                if "usage" in meta:
+                    usage = meta["usage"]
+
+            # Stream-error events — Bedrock surfaces these as normal events
+            # rather than exceptions on the iterator.  Re-raise as HTTP
+            # errors so the handler returns a clean response to the client.
+            elif "modelStreamErrorException" in event:
+                err = event["modelStreamErrorException"]
+                msg = err.get("message") or err.get("originalMessage") or "model stream error"
+                logger.error("Bedrock stream error for model %s: %s", model, msg)
+                raise HTTPException(status_code=500, detail=str(msg))
+            elif "throttlingException" in event:
+                err = event["throttlingException"]
+                msg = err.get("message", "throttled")
+                logger.warning("Bedrock stream throttling for model %s: %s", model, msg)
+                raise HTTPException(status_code=429, detail=str(msg))
+            elif "validationException" in event:
+                err = event["validationException"]
+                msg = err.get("message", "validation error")
+                logger.error("Bedrock stream validation for model %s: %s", model, msg)
+                raise HTTPException(status_code=400, detail=str(msg))
+            elif "serviceUnavailableException" in event:
+                err = event["serviceUnavailableException"]
+                msg = err.get("message", "service unavailable")
+                logger.warning("Bedrock service unavailable for model %s: %s", model, msg)
+                raise HTTPException(status_code=503, detail=str(msg))
+            elif "internalServerException" in event:
+                err = event["internalServerException"]
+                msg = err.get("message", "internal server error")
+                logger.error("Bedrock internal error for model %s: %s", model, msg)
+                raise HTTPException(status_code=500, detail=str(msg))
+
+        # If the stream ended without a terminal contentBlockStop for
+        # the last block (can happen on abrupt disconnect), flush what
+        # we have rather than silently drop it.
+        if current_block is not None:
+            if "toolUse" in current_block:
+                if current_tool_input_json:
+                    try:
+                        current_block["toolUse"]["input"] = json.loads(
+                            current_tool_input_json
+                        )
+                    except json.JSONDecodeError:
+                        current_block["toolUse"]["input"] = {
+                            "_raw": current_tool_input_json
+                        }
+                else:
+                    current_block["toolUse"]["input"] = {}
+            content_blocks.append(current_block)
+
+        return {
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": content_blocks,
+                },
+            },
+            "usage": usage,
+            "stopReason": stop_reason or "end_turn",
+        }
 
     async def _async_iterate(self, stream):
         """Helper method to convert sync iterator to async iterator"""
