@@ -15,6 +15,7 @@ from fastapi import HTTPException
 from starlette.concurrency import run_in_threadpool
 
 from api.models.base import BaseChatModel, BaseEmbeddingsModel
+from api.models.capabilities import lookup_capabilities
 from api.schema import (
     AssistantMessage,
     ChatRequest,
@@ -107,6 +108,15 @@ NO_ASSISTANT_PREFILL_MODELS = {
     "claude-opus-4-6",
 }
 
+# Fallback maxTokens used only when reasoning_effort is enabled AND the client
+# did not specify either max_tokens or max_completion_tokens.  Bedrock's
+# reasoning API requires a concrete budget_tokens value (which must be
+# strictly less than maxTokens), so we cannot pass None here.  32K is a
+# reasonable default that leaves room for both thinking and response content
+# without capping the output prematurely.  Clients who want a specific cap
+# should pass max_tokens explicitly.
+REASONING_DEFAULT_MAX_TOKENS = 32_000
+
 
 def list_bedrock_models() -> dict:
     """Automatically getting a list of supported models.
@@ -188,21 +198,36 @@ def list_bedrock_models() -> dict:
 
             inference_types = model.get("inferenceTypesSupported", [])
             input_modalities = model["inputModalities"]
+
+            def _build_entry(entry_id: str) -> dict:
+                """Build a model_list entry with modalities + capability metadata.
+
+                Capabilities come from a static lookup table (see
+                api.models.capabilities); modalities come from Bedrock's
+                list_foundation_models response.  Cross-region inference
+                profile IDs (e.g. us.*, global.*, apac.*) match the same
+                foundation model family in the capability table.
+                """
+                return {"modalities": input_modalities, **lookup_capabilities(entry_id)}
+
             # Add on-demand model list
             if "ON_DEMAND" in inference_types:
-                model_list[model_id] = {"modalities": input_modalities}
+                model_list[model_id] = _build_entry(model_id)
 
             # Add all inference profiles (cross-region and application) for this model
             for profile_id, metadata in profile_metadata.items():
                 if metadata.get("underlying_model_id") == model_id:
-                    model_list[profile_id] = {"modalities": input_modalities}
+                    model_list[profile_id] = _build_entry(profile_id)
 
     except Exception as e:
         logger.error(f"Unable to list models: {str(e)}")
 
     if not model_list:
         # In case stack not updated.
-        model_list[DEFAULT_MODEL] = {"modalities": ["TEXT", "IMAGE"]}
+        model_list[DEFAULT_MODEL] = {
+            "modalities": ["TEXT", "IMAGE"],
+            **lookup_capabilities(DEFAULT_MODEL),
+        }
 
     return model_list
 
@@ -217,6 +242,23 @@ class BedrockModel(BaseChatModel):
         global bedrock_model_list
         bedrock_model_list = list_bedrock_models()
         return list(bedrock_model_list.keys())
+
+    def list_models_with_metadata(self) -> dict[str, dict]:
+        """Return the full metadata dict for all models.
+
+        Refreshes the backing list (same side effect as list_models) and
+        returns a mapping of ``model_id -> {modalities, context_length,
+        max_completion_tokens}``.  Used by the /v1/models router to expose
+        capability metadata in OpenRouter-compatible fields.
+        """
+        global bedrock_model_list
+        bedrock_model_list = list_bedrock_models()
+        return dict(bedrock_model_list)
+
+    def get_model_metadata(self, model_id: str) -> dict:
+        """Return the metadata dict for a single model, or an empty dict
+        if the model is unknown.  Never raises."""
+        return dict(bedrock_model_list.get(model_id, {}))
 
     def validate(self, chat_request: ChatRequest):
         """Perform basic validation on requests"""
@@ -774,12 +816,12 @@ class BedrockModel(BaseChatModel):
         messages = self._parse_messages(chat_request)
         system_prompts = self._parse_system_prompts(chat_request)
 
-        # Base inference parameters.
-        inference_config = {
-            "maxTokens": chat_request.max_tokens,
-        }
-
-        # Only include optional parameters when specified
+        # Base inference parameters — treat every optional field uniformly:
+        # only include a key when the client explicitly set it.  Omitting
+        # `maxTokens` lets Bedrock use the model's native output ceiling.
+        inference_config: dict = {}
+        if chat_request.max_tokens is not None:
+            inference_config["maxTokens"] = chat_request.max_tokens
         if chat_request.temperature is not None:
             inference_config["temperature"] = chat_request.temperature
         if chat_request.top_p is not None:
@@ -818,11 +860,16 @@ class BedrockModel(BaseChatModel):
             model_lower = resolved_model.lower()
 
             if "anthropic.claude" in model_lower:
-                # Claude format: reasoning_config = object with budget_tokens
+                # Claude format: reasoning_config = object with budget_tokens.
+                # budget_tokens must be strictly less than maxTokens, so when
+                # reasoning is enabled we need a concrete number.  Prefer
+                # the explicit request fields; fall back to a sensible cap
+                # that matches typical reasoning workloads without capping
+                # the response prematurely.
                 max_tokens = (
                     chat_request.max_completion_tokens
-                    if chat_request.max_completion_tokens
-                    else chat_request.max_tokens
+                    or chat_request.max_tokens
+                    or REASONING_DEFAULT_MAX_TOKENS
                 )
                 budget_tokens = self._calc_budget_tokens(
                     max_tokens, chat_request.reasoning_effort

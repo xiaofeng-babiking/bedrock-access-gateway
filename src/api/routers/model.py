@@ -20,9 +20,27 @@ async def validate_model_id(model_id: str):
         raise HTTPException(status_code=500, detail="Unsupported Model Id")
 
 
+def _build_model_response(model_id: str, metadata: dict) -> Model:
+    """Build a Model response object from the proxy's internal metadata.
+
+    Extracts capability fields (context_length, max_completion_tokens)
+    if present; otherwise leaves them as None, which Pydantic serializes
+    as JSON null.  Clients that don't care about capabilities (strict
+    OpenAI-compat) can ignore the extra fields safely.
+    """
+    return Model(
+        id=model_id,
+        context_length=metadata.get("context_length"),
+        max_completion_tokens=metadata.get("max_completion_tokens"),
+    )
+
+
 @router.get("", response_model=Models)
 async def list_models():
-    model_list = [Model(id=model_id) for model_id in chat_model.list_models()]
+    model_list = [
+        _build_model_response(model_id, meta)
+        for model_id, meta in chat_model.list_models_with_metadata().items()
+    ]
     return Models(data=model_list)
 
 
@@ -37,4 +55,4 @@ async def get_model(
     ],
 ):
     await validate_model_id(model_id)
-    return Model(id=model_id)
+    return _build_model_response(model_id, chat_model.get_model_metadata(model_id))
