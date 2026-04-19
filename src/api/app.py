@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from mangum import Mangum
 
+from api.middleware.request_log import install_request_log_middleware
 from api.routers import chat, embeddings, model
 from api.setting import API_ROUTE_PREFIX, DESCRIPTION, SUMMARY, TITLE, VERSION
 
@@ -38,6 +39,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Structured per-request logging — one INFO line per request with
+# path, status, elapsed, request size, and (where available) model.
+# Critically emits CONN_CLOSED / EXCEPTION:<Type> for silent failures.
+install_request_log_middleware(app)
 
 
 app.include_router(model.router, prefix=API_ROUTE_PREFIX)
